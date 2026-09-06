@@ -1,0 +1,570 @@
+import time
+import random
+import logging
+import argparse
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
+from dtbs import TOPICS, TEMPLATES, ADJACENT_KEYS
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+
+
+# ------------------------------------------------------------------ #
+#  TIMING — mixed distributions, not just Gaussian                    #
+# ------------------------------------------------------------------ #
+
+def gauss_delay(mean, sigma, min_val=0.05):
+    return max(min_val, random.gauss(mean, sigma))
+
+
+def pareto_delay(min_val, shape=1.5):
+    """Heavy-tailed — occasionally very long pauses like a distracted human."""
+    return min_val * random.paretovariate(shape)
+
+
+def exp_delay(mean, min_val=0.05):
+    """Exponential — short bursts with rare long gaps."""
+    return max(min_val, random.expovariate(1.0 / mean))
+
+
+def human_delay(mean, sigma, min_val=0.05):
+    """
+    Randomly picks a distribution per call.
+    Humans aren't consistently Gaussian — sometimes fast,
+    sometimes randomly long, never perfectly bell-curved.
+    """
+    roll = random.random()
+    if roll < 0.65:
+        return gauss_delay(mean, sigma, min_val)
+    elif roll < 0.85:
+        return exp_delay(mean, min_val)
+    else:
+        return min(pareto_delay(mean * 0.5), mean * 6)
+
+
+# ------------------------------------------------------------------ #
+#  BOT                                                                #
+# ------------------------------------------------------------------ #
+
+class BingRewardsBot:
+    def __init__(self, use_profile=False, headless=False):
+        options = Options()
+
+        if use_profile:
+            options.add_argument(r"user-data-dir=C:\Users\Admin\Downloads\bing_bot_profile")
+
+        if headless:
+            options.add_argument("--headless=new")
+
+        options.add_argument("--homepage=https://www.bing.com")
+        options.add_experimental_option("prefs", {
+            "homepage": "https://www.bing.com",
+            "startup_urls": ["https://www.bing.com"],
+            "session.startup_urls": ["https://www.bing.com"]
+        })
+
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        w = random.randint(1280, 1440)
+        h = random.randint(768, 900)
+        options.add_argument(f"--window-size={w},{h}")
+
+        self.driver = webdriver.Edge(options=options)
+        self.driver.set_window_size(w, h)
+        self.win_w = w
+        self.win_h = h
+
+        self.driver.get("https://www.bing.com")
+        self._inject_stealth()
+
+        self.wait = WebDriverWait(self.driver, 15)
+
+    # ------------------------------------------------------------------ #
+    #  STEALTH                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _inject_stealth(self):
+        scripts = [
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})",
+            "Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]})",
+            "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']})",
+            "window.chrome = { runtime: {} };",
+            """
+            const _origPerms = window.navigator.permissions.query;
+            window.navigator.permissions.query = (params) =>
+                params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : _origPerms(params);
+            """,
+            f"Object.defineProperty(screen, 'width',  {{get: () => {self.win_w}}});",
+            f"Object.defineProperty(screen, 'height', {{get: () => {self.win_h}}});",
+            f"Object.defineProperty(navigator, 'hardwareConcurrency', "
+            f"{{get: () => {random.choice([4, 8, 12, 16])}}});",
+            f"Object.defineProperty(navigator, 'deviceMemory', "
+            f"{{get: () => {random.choice([4, 8, 16])}}});",
+        ]
+        for script in scripts:
+            try:
+                self.driver.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": script}
+                )
+            except Exception as e:
+                logging.warning(f"[STEALTH] Script skipped: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  QUERY GENERATION                                                    #
+    # ------------------------------------------------------------------ #
+
+    def generate_query(self):
+        """
+        30% chance: raw 1-3 word search (no template).
+        Humans often type short raw queries, not always full questions.
+        """
+        topic = random.choice(TOPICS)
+
+        if random.random() < 0.30:
+            words = topic.split()
+            if len(words) > 2 and random.random() < 0.5:
+                return ' '.join(random.sample(words, random.randint(1, 2)))
+            return topic
+
+        template = random.choice(TEMPLATES)
+        if "{alternative}" in template:
+            alt = random.choice([t for t in TOPICS if t != topic])
+            return template.format(topic=topic, alternative=alt)
+        return template.format(topic=topic)
+
+    # ------------------------------------------------------------------ #
+    #  TYPING                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _maybe_typo(self, char):
+        if char in ADJACENT_KEYS and char != ' ' and random.random() < 0.10:
+            wrong = random.choice(ADJACENT_KEYS[char])
+            return [('type', wrong), ('backspace', None), ('type', char)]
+        return [('type', char)]
+
+    def human_type(self, element, text):
+        base_speed = gauss_delay(0.07, 0.02)
+        for char in text:
+            if random.random() < 0.04:
+                time.sleep(gauss_delay(0.6, 0.2))
+            speed = (base_speed * 0.4 if random.random() < 0.15
+                     else gauss_delay(base_speed, base_speed * 0.4))
+            for action, val in self._maybe_typo(char):
+                if action == 'type':
+                    element.send_keys(val)
+                elif action == 'backspace':
+                    time.sleep(gauss_delay(0.08, 0.03))
+                    element.send_keys(Keys.BACKSPACE)
+                    time.sleep(gauss_delay(0.12, 0.04))
+            time.sleep(max(0.02, speed))
+        # Pause before Enter — like re-reading the query
+        time.sleep(gauss_delay(0.5, 0.15))
+
+    # ------------------------------------------------------------------ #
+    #  MOUSE — JS dispatch only, no move_by_offset ever                   #
+    # ------------------------------------------------------------------ #
+
+    def _js_mouse_move(self, x, y):
+        self.driver.execute_script("""
+            document.dispatchEvent(new MouseEvent('mousemove', {
+                bubbles: true, cancelable: true,
+                clientX: arguments[0], clientY: arguments[1]
+            }));
+        """, x, y)
+
+    def _bezier_js_move(self, x0, y0, x1, y1):
+        """Curved mouse path via JS events — clamped, never out of bounds."""
+        steps = random.randint(15, 25)
+        cx = max(10, min(self.win_w - 10,
+                         random.randint(min(x0, x1), max(x0, x1) + 1)))
+        cy = max(10, min(self.win_h - 10,
+                         random.randint(min(y0, y1) - 50, max(y0, y1) + 50)))
+        for i in range(steps + 1):
+            t = i / steps
+            px = int(max(0, min(self.win_w - 1,
+                                (1-t)**2 * x0 + 2*(1-t)*t * cx + t**2 * x1)))
+            py = int(max(0, min(self.win_h - 1,
+                                (1-t)**2 * y0 + 2*(1-t)*t * cy + t**2 * y1)))
+            self._js_mouse_move(px, py)
+            time.sleep(gauss_delay(0.012, 0.004))
+
+    def smooth_move_to(self, element):
+        try:
+            rect = self.driver.execute_script(
+                "var r = arguments[0].getBoundingClientRect();"
+                "return {x: r.left, y: r.top, w: r.width, h: r.height};",
+                element
+            )
+            tx = max(0, min(self.win_w - 1,
+                            int(rect['x'] + rect['w'] * random.uniform(0.2, 0.8))))
+            ty = max(0, min(self.win_h - 1,
+                            int(rect['y'] + rect['h'] * random.uniform(0.2, 0.8))))
+            try:
+                pos = self.driver.execute_script(
+                    "return {x: window._mx || window.innerWidth/2,"
+                    "        y: window._my || window.innerHeight/2};"
+                )
+                mx, my = int(pos['x']), int(pos['y'])
+            except Exception:
+                mx, my = self.win_w // 2, self.win_h // 2
+
+            self.driver.execute_script(
+                "window._mx = arguments[0]; window._my = arguments[1];", tx, ty
+            )
+            self._bezier_js_move(mx, my, tx, ty)
+            ActionChains(self.driver).move_to_element(element).perform()
+
+        except Exception:
+            try:
+                ActionChains(self.driver).move_to_element(element).perform()
+            except Exception:
+                pass
+
+    def _safe_mouse_wander(self):
+        logging.info("  [MOUSE] Warm-up wander...")
+        cx, cy = self.win_w // 2, self.win_h // 2
+        for _ in range(random.randint(2, 4)):
+            tx = random.randint(80, self.win_w - 80)
+            ty = random.randint(60, self.win_h - 60)
+            self._bezier_js_move(cx, cy, tx, ty)
+            cx, cy = tx, ty
+            time.sleep(gauss_delay(0.3, 0.1))
+        logging.info("  [MOUSE] Warm-up done.")
+
+    def human_mouse_interaction(self):
+        """
+        3 modes picked randomly:
+        - 25%: skip entirely (scanned title, moved on)
+        - 50%: hover only
+        - 25%: hover + maybe click and read
+        """
+        mode = random.random()
+
+        if mode < 0.25:
+            logging.info("  [MOUSE] Skipped — just scanned results.")
+            return
+
+        try:
+            results = self.driver.find_elements(By.CSS_SELECTOR, "li.b_algo h2 a")
+            if not results:
+                logging.info("  [MOUSE] No results to interact with.")
+                return
+
+            targets = results[:min(3, len(results))]
+            target = random.choice(targets)
+            logging.info(f"  [MOUSE] Hovering: '{target.text[:55]}'")
+            self.smooth_move_to(target)
+            time.sleep(human_delay(1.5, 0.4))
+
+            if mode > 0.75 and random.random() < 0.30:
+                logging.info("  [MOUSE] Clicking to read page...")
+                target.click()
+                read_time = human_delay(5.0, 2.0)
+                logging.info(f"  [MOUSE] Reading for {read_time:.1f}s...")
+                time.sleep(read_time)
+                self.natural_scroll(depth=random.uniform(0.15, 0.55))
+                logging.info("  [MOUSE] Going back...")
+                self.driver.back()
+                time.sleep(human_delay(2.0, 0.6))
+            else:
+                logging.info("  [MOUSE] Hover only.")
+
+            if len(targets) > 1 and random.random() < 0.35:
+                second = random.choice([r for r in targets if r != target])
+                logging.info(f"  [MOUSE] Glancing at: '{second.text[:55]}'")
+                self.smooth_move_to(second)
+                time.sleep(human_delay(0.7, 0.25))
+
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  SCROLLING — active down, pause, active up                          #
+    # ------------------------------------------------------------------ #
+
+    def natural_scroll(self, depth=None):
+        if depth is None:
+            depth = random.uniform(0.35, 0.70)
+
+        # 15% chance: quick glance only, barely scrolls
+        if random.random() < 0.15:
+            steps = random.randint(2, 5)
+            logging.info(f"  [SCROLL] Quick glance ({steps} steps only).")
+            for _ in range(steps):
+                self.driver.execute_script(
+                    f"window.scrollBy(0, {random.randint(60, 120)});")
+                time.sleep(random.uniform(0.05, 0.15))
+            time.sleep(human_delay(0.8, 0.3))
+            self.driver.execute_script("window.scrollTo(0, 0);")
+            return
+
+        total_height = self.driver.execute_script("return document.body.scrollHeight")
+        target_pos = int(total_height * depth)
+        current_pos = 0
+        is_fast_reader = random.random() < 0.4
+
+        logging.info(f"  [SCROLL] Target {target_pos}px "
+                     f"({int(depth*100)}% of {total_height}px) | "
+                     f"{'fast skim' if is_fast_reader else 'slow read'}")
+
+        # ── PHASE 1: SCROLL DOWN ─────────────────────────────── #
+        logging.info("  [SCROLL↓] Scrolling down...")
+        while current_pos < target_pos:
+            burst = random.randint(8, 25)
+            for _ in range(burst):
+                if current_pos >= target_pos:
+                    break
+                step = (random.randint(8, 20) if is_fast_reader
+                        else random.randint(3, 12))
+                self.driver.execute_script(f"window.scrollBy(0, {step});")
+                current_pos += step
+                time.sleep(random.uniform(0.008, 0.028))
+
+            roll = random.random()
+            if roll < 0.30:
+                pause = human_delay(0.6, 0.25)
+                logging.info(f"  [SCROLL↓] Quick glance ({pause:.1f}s) at {current_pos}px")
+                time.sleep(pause)
+            elif roll < 0.50:
+                pause = human_delay(2.5, 0.9)
+                logging.info(f"  [SCROLL↓] Reading pause ({pause:.1f}s) at {current_pos}px")
+                time.sleep(pause)
+            elif roll < 0.60:
+                back = random.randint(30, 150)
+                logging.info(f"  [SCROLL↓] Re-reading — back {back}px")
+                self.driver.execute_script(f"window.scrollBy(0, -{back});")
+                current_pos -= back
+                time.sleep(human_delay(1.2, 0.4))
+            elif roll < 0.65:
+                time.sleep(random.uniform(0.04, 0.14))
+            # else: no pause, keep going
+
+        # ── PHASE 2: PAUSE AT BOTTOM ─────────────────────────── #
+        bottom_pause = human_delay(1.8, 0.7)
+        logging.info(f"  [SCROLL] Bottom at {current_pos}px — "
+                     f"pausing {bottom_pause:.1f}s...")
+        time.sleep(bottom_pause)
+
+        # ── PHASE 3: SCROLL BACK UP ───────────────────────────── #
+        logging.info("  [SCROLL↑] Scrolling back up...")
+        while current_pos > 0:
+            step = random.randint(15, 45)
+            self.driver.execute_script(f"window.scrollBy(0, -{step});")
+            current_pos = max(0, current_pos - step)
+            time.sleep(random.uniform(0.007, 0.020))
+            if random.random() < 0.06:
+                pause = human_delay(0.5, 0.2)
+                logging.info(f"  [SCROLL↑] Brief stop at {current_pos}px ({pause:.1f}s)")
+                time.sleep(pause)
+
+        self.driver.execute_script("window.scrollTo(0, 0);")
+        logging.info("  [SCROLL↑] Back at top.")
+
+    # ------------------------------------------------------------------ #
+    #  SEARCH BOX                                                          #
+    # ------------------------------------------------------------------ #
+
+    def get_search_box(self):
+        if "bing.com" not in self.driver.current_url:
+            logging.warning(f"  [NAV] Not on Bing — navigating back...")
+            self.driver.get("https://www.bing.com")
+            time.sleep(human_delay(2.0, 0.5))
+        try:
+            return self.wait.until(EC.element_to_be_clickable((By.NAME, "q")))
+        except Exception:
+            logging.warning("  [NAV] Search box missing — hard nav to bing.com...")
+            self.driver.get("https://www.bing.com")
+            time.sleep(human_delay(2.0, 0.5))
+            return self.wait.until(EC.element_to_be_clickable((By.NAME, "q")))
+
+    def clear_and_focus_box(self, box):
+        self.smooth_move_to(box)
+        box.click()
+        time.sleep(gauss_delay(0.25, 0.08))
+        box.send_keys(Keys.CONTROL, "a")
+        time.sleep(gauss_delay(0.1, 0.03))
+        box.send_keys(Keys.DELETE)
+        time.sleep(gauss_delay(0.2, 0.07))
+
+    # ------------------------------------------------------------------ #
+    #  SESSION PLANNING — burst clusters, variable total count            #
+    # ------------------------------------------------------------------ #
+
+    def _build_session_plan(self):
+        """
+        Builds a session of burst clusters rather than evenly spaced searches.
+        3 session types:
+        - Short  (20%): 8–14 searches, 1–2 bursts
+        - Normal (50%): 18–28 searches, 2–3 bursts
+        - Long   (30%): 28–35 searches, 3–4 bursts
+        """
+        roll = random.random()
+        if roll < 0.20:
+            total = random.randint(8, 14)
+            num_bursts = random.randint(1, 2)
+            session_label = "short"
+        elif roll < 0.70:
+            total = random.randint(18, 28)
+            num_bursts = random.randint(2, 3)
+            session_label = "normal"
+        else:
+            total = random.randint(28, 35)
+            num_bursts = random.randint(3, 4)
+            session_label = "long"
+
+        # Distribute searches across bursts unevenly
+        plan = []
+        remaining = total
+        for b in range(num_bursts):
+            if b == num_bursts - 1:
+                burst_size = remaining
+            else:
+                lo = max(3, remaining // (num_bursts - b) - 3)
+                hi = max(4, remaining // (num_bursts - b) + 3)
+                burst_size = min(random.randint(lo, hi),
+                                 remaining - (num_bursts - b - 1) * 3)
+            remaining -= burst_size
+            gap = gauss_delay(45.0, 15.0) if b < num_bursts - 1 else 0
+            plan.append((burst_size, gap))
+
+        logging.info(f"[BOT] Session type  : {session_label}")
+        logging.info(f"[BOT] Total searches: {total} across {num_bursts} burst(s)")
+        for idx, (size, gap) in enumerate(plan):
+            logging.info(f"  Burst {idx+1}: {size} searches"
+                         + (f" → {gap:.0f}s break after" if gap else " → end"))
+        return plan
+
+    # ------------------------------------------------------------------ #
+    #  PACING                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _inter_search_pause(self, search_num):
+        roll = random.random()
+        if roll < 0.05:
+            pause = min(pareto_delay(10.0), 60.0)
+            logging.info(f"  [PACE] Distraction break ({pause:.1f}s)...")
+        elif roll < 0.20:
+            pause = exp_delay(7.0)
+            logging.info(f"  [PACE] Longer pause ({pause:.1f}s)...")
+        else:
+            pause = human_delay(3.5, 1.2, min_val=1.5)
+            logging.info(f"  [PACE] Normal pause ({pause:.1f}s)...")
+        time.sleep(max(1.5, pause))
+
+    # ------------------------------------------------------------------ #
+    #  MAIN LOOP                                                           #
+    # ------------------------------------------------------------------ #
+
+    def execute_searches(self):
+        try:
+            logging.info("[BOT] Navigating to bing.com...")
+            self.driver.get("https://www.bing.com")
+            time.sleep(human_delay(2.5, 0.6))
+            logging.info(f"[BOT] Loaded   : '{self.driver.title}'")
+            logging.info(f"[BOT] Window   : {self.win_w}x{self.win_h}")
+
+            self._safe_mouse_wander()
+
+            plan = self._build_session_plan()
+            total = sum(s for s, _ in plan)
+            search_num = 0
+
+            for burst_idx, (burst_size, gap_after) in enumerate(plan):
+                logging.info(f"\n{'='*60}")
+                logging.info(f"[BURST {burst_idx+1}/{len(plan)}] "
+                             f"Starting — {burst_size} searches this burst")
+                logging.info(f"{'='*60}")
+
+                for j in range(burst_size):
+                    search_num += 1
+                    query = self.generate_query()
+
+                    logging.info(f"{'─'*60}")
+                    logging.info(f"[{search_num}/{total}] Query  : '{query}'")
+                    logging.info(f"[{search_num}/{total}] At URL : {self.driver.current_url}")
+
+                    try:
+                        logging.info("  [TYPE] Locating search box...")
+                        box = self.get_search_box()
+                        logging.info("  [TYPE] Clearing...")
+                        self.clear_and_focus_box(box)
+                        logging.info("  [TYPE] Typing (with human delays + typos)...")
+                        self.human_type(box, query)
+                        logging.info("  [TYPE] Enter.")
+                        box.send_keys(Keys.ENTER)
+                    except Exception as e:
+                        logging.warning(f"  [!] Search {search_num} failed: {e}")
+                        continue
+
+                    wait = human_delay(3.0, 0.7)
+                    logging.info(f"  [WAIT] {wait:.1f}s for results to load...")
+                    time.sleep(wait)
+                    logging.info(f"  [PAGE] Title: '{self.driver.title}'")
+
+                    try:
+                        count = len(self.driver.find_elements(
+                            By.CSS_SELECTOR, "li.b_algo"))
+                        logging.info(f"  [PAGE] {count} organic results found")
+                    except Exception:
+                        pass
+
+                    logging.info("  [MOUSE] Starting interaction phase...")
+                    self.human_mouse_interaction()
+
+                    logging.info("  [SCROLL] Starting scroll sequence...")
+                    self.natural_scroll()
+
+                    self._inter_search_pause(search_num)
+                    logging.info(f"[{search_num}/{total}] Search complete.\n")
+
+                # ── Gap between bursts ── #
+                if gap_after > 0:
+                    logging.info(f"\n[BURST {burst_idx+1}] Complete. "
+                                 f"Switching tasks for {gap_after:.0f}s "
+                                 f"(like reading another tab)...")
+                    time.sleep(gap_after)
+                    logging.info(f"[BURST {burst_idx+2}/{len(plan)}] Resuming...\n")
+
+            logging.info(f"\n{'='*60}")
+            logging.info(f"[BOT] Session complete — {total} searches done.")
+            logging.info(f"{'='*60}")
+
+        except Exception as e:
+            logging.error(f"[BOT] Critical error: {e}")
+        finally:
+            logging.info("[BOT] Closing browser. Goodbye.")
+            self.driver.quit()
+
+
+# ------------------------------------------------------------------ #
+#  ENTRY POINT                                                         #
+# ------------------------------------------------------------------ #
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bing Rewards Bot (Edge)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Use saved Edge profile (stays logged in)")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run browser in background")
+    args = parser.parse_args()
+
+    bot = BingRewardsBot(use_profile=args.profile, headless=args.headless)
+
+    if not args.headless:
+        logging.info("Browser launched on bing.com. Log in to Microsoft if prompted.")
+        input("Press Enter to begin searches...\n")
+
+    bot.execute_searches()
